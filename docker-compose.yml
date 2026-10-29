@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    init: true
+    env_file:
+      - .env
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./app:/app/app:ro
+    command:
+      - watchfiles
+      - --filter
+      - python
+      - --target-type
+      - command
+      - python -m app.main
+      - /app/app
+    stop_grace_period: 30s
