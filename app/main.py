@@ -13,7 +13,7 @@ BOT_TOKEN_VARIABLE = "BOT_TOKEN"
 START_GREETING = "Привіт! Бот працює 👋"
 HELP_COMMAND = "help"
 HELP_MESSAGE = "Це фінансовий бот 💰"
-
+LOGGER = logging.getLogger(__name__)
 
 async def handle_start(message: Message) -> None:
     await message.answer(text=START_GREETING)
@@ -34,6 +34,7 @@ async def main() -> None:
     dispatcher.message.register(handle_help, Command(HELP_COMMAND))
 
     async with Bot(token=bot_token) as bot:
+        LOGGER.info("Бот почав роботу")
         await dispatcher.start_polling(bot)
 
 
