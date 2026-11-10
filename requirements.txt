@@ -1,3 +1,5 @@
 aiogram==3.31.0
 python-dotenv==1.2.1
 watchfiles==1.1.1
+SQLAlchemy==2.0.57
+psycopg[binary]==3.3.8
