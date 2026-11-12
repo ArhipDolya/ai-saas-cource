@@ -1,16 +1,26 @@
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Engine
 
-from app.models import CATEGORIES, CATEGORY_NAME_MAX_LENGTH, TRANSACTIONS, USERS
+from app.models import (
+    CATEGORIES,
+    CATEGORY_NAME_MAX_LENGTH,
+    EXPENSE_TRANSACTION_TYPE,
+    INCOME_TRANSACTION_TYPE,
+    INCOMES,
+    TRANSACTIONS,
+    USERS,
+)
 
 
 EXPENSE_USAGE = "Використай команду: /expense 120 кава"
 AMOUNT_PATTERN = re.compile(r"[0-9]+(?:[.,][0-9]{1,2})?")
+ZERO_AMOUNT = Decimal("0.00")
 MINIMUM_EXPENSE_AMOUNT = Decimal("0.01")
 MAXIMUM_EXPENSE_AMOUNT = Decimal("9999999999.99")  # NUMERIC(12, 2).
 AMOUNT_QUANTUM = Decimal("0.01")
@@ -33,6 +43,26 @@ class CreatedExpense:
     transaction_id: int
     amount: Decimal
     category_name: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransactionRecord:
+    id: int
+    user_id: int
+    telegram_id: int
+    category_id: int
+    category_name: str
+    transaction_type: str
+    amount: Decimal
+    description: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class FinancialSummary:
+    total_income: Decimal
+    total_expense: Decimal
+    balance: Decimal
 
 
 def parse_expense(command_args: str | None) -> ExpenseInput:
@@ -141,3 +171,104 @@ class ExpenseService:
             ),
         ).scalar_one()
         return category_id
+
+    def list_transactions(self) -> list[TransactionRecord]:
+        transactions_query = select(
+            TRANSACTIONS.c.id,
+            TRANSACTIONS.c.user_id,
+            USERS.c.telegram_id,
+            TRANSACTIONS.c.category_id,
+            CATEGORIES.c.name.label("category_name"),
+            TRANSACTIONS.c.transaction_type,
+            TRANSACTIONS.c.amount,
+            TRANSACTIONS.c.description,
+            TRANSACTIONS.c.created_at,
+        ).select_from(
+            TRANSACTIONS.join(
+                CATEGORIES,
+                (TRANSACTIONS.c.category_id == CATEGORIES.c.id)
+                & (TRANSACTIONS.c.user_id == CATEGORIES.c.user_id),
+            ).join(
+                USERS,
+                TRANSACTIONS.c.user_id == USERS.c.id,
+            ),
+        )
+        incomes_query = select(
+            INCOMES.c.id,
+            INCOMES.c.user_id,
+            USERS.c.telegram_id,
+            INCOMES.c.category_id,
+            CATEGORIES.c.name.label("category_name"),
+            literal(INCOME_TRANSACTION_TYPE).label("transaction_type"),
+            INCOMES.c.amount,
+            INCOMES.c.description,
+            INCOMES.c.created_at,
+        ).select_from(
+            INCOMES.join(
+                CATEGORIES,
+                (INCOMES.c.category_id == CATEGORIES.c.id)
+                & (INCOMES.c.user_id == CATEGORIES.c.user_id),
+            ).join(
+                USERS,
+                INCOMES.c.user_id == USERS.c.id,
+            ),
+        )
+        combined_operations = union_all(
+            transactions_query,
+            incomes_query,
+        ).subquery()
+        statement = select(combined_operations).order_by(
+            combined_operations.c.created_at.desc(),
+            combined_operations.c.id.desc(),
+        )
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).all()
+
+        return [
+            TransactionRecord(
+                id=row.id,
+                user_id=row.user_id,
+                telegram_id=row.telegram_id,
+                category_id=row.category_id,
+                category_name=row.category_name,
+                transaction_type=row.transaction_type,
+                amount=row.amount,
+                description=row.description,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    def get_summary(self) -> FinancialSummary:
+        incomes_table_sum = select(
+            func.coalesce(func.sum(INCOMES.c.amount), ZERO_AMOUNT),
+        ).scalar_subquery()
+        transactions_income_sum = (
+            select(
+                func.coalesce(func.sum(TRANSACTIONS.c.amount), ZERO_AMOUNT),
+            )
+            .where(TRANSACTIONS.c.transaction_type == INCOME_TRANSACTION_TYPE)
+            .scalar_subquery()
+        )
+        expense_subquery = (
+            select(
+                func.coalesce(func.sum(TRANSACTIONS.c.amount), ZERO_AMOUNT),
+            )
+            .where(TRANSACTIONS.c.transaction_type == EXPENSE_TRANSACTION_TYPE)
+            .scalar_subquery()
+        )
+        statement = select(
+            (incomes_table_sum + transactions_income_sum).label("total_income"),
+            expense_subquery.label("total_expense"),
+        )
+        with self._engine.connect() as connection:
+            row = connection.execute(statement).one()
+
+        total_income = Decimal(row.total_income).quantize(AMOUNT_QUANTUM)
+        total_expense = Decimal(row.total_expense).quantize(AMOUNT_QUANTUM)
+        balance = (total_income - total_expense).quantize(AMOUNT_QUANTUM)
+        return FinancialSummary(
+            total_income=total_income,
+            total_expense=total_expense,
+            balance=balance,
+        )

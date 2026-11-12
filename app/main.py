@@ -8,6 +8,7 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api import resolve_api_address, start_api_server
 from app.database import (
     ENV_PATH,
     DatabaseConfigurationError,
@@ -78,14 +79,24 @@ async def main() -> None:
         raise ValueError("Set BOT_TOKEN in the environment or the project .env file.")
 
     engine = create_database_engine()
+    api_runner = None
     try:
         await asyncio.to_thread(initialize_database, engine=engine)
-        dispatcher = create_dispatcher(expense_service=ExpenseService(engine))
+        expense_service = ExpenseService(engine)
+        api_host, api_port = resolve_api_address()
+        api_runner = await start_api_server(
+            expense_service=expense_service,
+            host=api_host,
+            port=api_port,
+        )
+        dispatcher = create_dispatcher(expense_service=expense_service)
 
         async with Bot(token=bot_token) as bot:
             LOGGER.info("Бот почав роботу")
             await dispatcher.start_polling(bot)
     finally:
+        if api_runner is not None:
+            await api_runner.cleanup()
         await asyncio.to_thread(engine.dispose)
 
 

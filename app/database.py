@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.engine.interfaces import ReflectedForeignKeyConstraint
 from sqlalchemy.exc import ArgumentError
@@ -13,6 +13,8 @@ from app.models import (
     CATEGORY_OWNER_FOREIGN_KEY,
     CATEGORY_OWNER_UNIQUE,
     DATABASE_SCHEMA,
+    INCOME_CATEGORY_OWNER_FOREIGN_KEY,
+    INCOMES,
     METADATA,
     TRANSACTIONS,
 )
@@ -87,6 +89,38 @@ def initialize_database(engine: Engine) -> None:
                 AddConstraint(
                     element=CATEGORY_OWNER_FOREIGN_KEY,
                     isolate_from_table=False,
+                ),
+            )
+
+        income_foreign_keys = inspector.get_foreign_keys(
+            table_name=INCOMES.name,
+            schema=DATABASE_SCHEMA,
+        )
+        has_income_owner_foreign_key = any(
+            _is_category_owner_foreign_key(foreign_key)
+            for foreign_key in income_foreign_keys
+        )
+        if not has_income_owner_foreign_key:
+            connection.execute(
+                AddConstraint(
+                    element=INCOME_CATEGORY_OWNER_FOREIGN_KEY,
+                    isolate_from_table=False,
+                ),
+            )
+
+        income_columns = {
+            column["name"]
+            for column in inspector.get_columns(
+                table_name=INCOMES.name,
+                schema=DATABASE_SCHEMA,
+            )
+        }
+        has_income_description = "description" in income_columns
+        if not has_income_description:
+            connection.execute(
+                text(
+                    "ALTER TABLE public.incomes "
+                    "ADD COLUMN IF NOT EXISTS description VARCHAR(255)",
                 ),
             )
 
