@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api import resolve_api_address, start_api_server
+from app.auth import AdminAuthConfigError, AdminAuthService, load_admin_password
 from app.database import (
     ENV_PATH,
     DatabaseConfigurationError,
@@ -78,6 +79,8 @@ async def main() -> None:
     if not bot_token:
         raise ValueError("Set BOT_TOKEN in the environment or the project .env file.")
 
+    admin_password = load_admin_password()
+    auth_service = AdminAuthService(admin_password=admin_password)
     engine = create_database_engine()
     api_runner = None
     try:
@@ -86,6 +89,7 @@ async def main() -> None:
         api_host, api_port = resolve_api_address()
         api_runner = await start_api_server(
             expense_service=expense_service,
+            auth_service=auth_service,
             host=api_host,
             port=api_port,
         )
@@ -112,6 +116,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     try:
         asyncio.run(main())
+    except AdminAuthConfigError:
+        LOGGER.error("Admin password configuration failed")
+        raise SystemExit(
+            "Cannot start bot. Set ADMIN_PASSWORD in the environment or .env.",
+        ) from None
     except (DatabaseConfigurationError, SQLAlchemyError) as error:
         LOGGER.error(
             "Database startup failed",
