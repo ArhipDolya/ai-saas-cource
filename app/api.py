@@ -7,6 +7,12 @@ from aiohttp import web
 from aiohttp.typedefs import Handler
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.ai import (
+    GeminiAnalysisError,
+    GeminiConfigurationError,
+    TransactionAnalysisResult,
+    TransactionAnalysisService,
+)
 from app.auth import TOKEN_TTL_SECONDS, AdminAuthService, extract_bearer_token
 from app.expenses import (
     CreateTransactionInput,
@@ -29,6 +35,7 @@ AUTH_SESSION_PATH = "/api/auth/session"
 TRANSACTIONS_PATH = "/api/transactions"
 TRANSACTION_ITEM_PATH = "/api/transactions/{id}"
 SUMMARY_PATH = "/api/summary"
+AI_ANALYZE_TRANSACTIONS_PATH = "/api/ai/analyze-transactions"
 DEFAULT_API_HOST = "0.0.0.0"  # Bind all interfaces for local and Docker access
 DEFAULT_API_PORT = 8000  # Default HTTP port for backend API
 API_HOST_VARIABLE = "API_HOST"
@@ -42,6 +49,9 @@ INVALID_JSON_MESSAGE = "Некоректний JSON у тілі запиту."
 PASSWORD_REQUIRED_MESSAGE = "Введіть пароль адміністратора."
 INVALID_PASSWORD_MESSAGE = "Невірний пароль адміністратора."
 UNAUTHORIZED_MESSAGE = "Потрібна авторизація. Введіть пароль адміністратора."
+AI_CONFIG_ERROR_MESSAGE = (
+    "AI-аналіз недоступний: перевірте налаштування GEMINI_API_KEY."
+)
 CREATE_TRANSACTION_ERROR_MESSAGE = "Failed to save transaction."
 DELETE_TRANSACTION_ERROR_MESSAGE = "Failed to delete transaction."
 DATABASE_ERROR_MESSAGE = "Failed to fetch transactions."
@@ -54,6 +64,10 @@ AUTH_SERVICE_KEY: web.AppKey[AdminAuthService] = web.AppKey(
     "auth_service",
     AdminAuthService,
 )
+ANALYSIS_SERVICE_KEY: web.AppKey[TransactionAnalysisService] = web.AppKey(
+    "analysis_service",
+    TransactionAnalysisService,
+)
 PUBLIC_PATHS = frozenset({AUTH_LOGIN_PATH})
 LOGGER = logging.getLogger(__name__)
 
@@ -62,12 +76,14 @@ async def start_api_server(
     *,
     expense_service: ExpenseService,
     auth_service: AdminAuthService,
+    analysis_service: TransactionAnalysisService | None = None,
     host: str = DEFAULT_API_HOST,
     port: int = DEFAULT_API_PORT,
 ) -> web.AppRunner:
     app = create_api_app(
         expense_service=expense_service,
         auth_service=auth_service,
+        analysis_service=analysis_service,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -88,10 +104,12 @@ def create_api_app(
     *,
     expense_service: ExpenseService,
     auth_service: AdminAuthService,
+    analysis_service: TransactionAnalysisService | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[require_admin_auth_middleware])
     app[EXPENSE_SERVICE_KEY] = expense_service
     app[AUTH_SERVICE_KEY] = auth_service
+    app[ANALYSIS_SERVICE_KEY] = analysis_service or TransactionAnalysisService()
     app.router.add_post(AUTH_LOGIN_PATH, handle_login)
     app.router.add_options(AUTH_LOGIN_PATH, handle_cors_preflight)
     app.router.add_get(AUTH_SESSION_PATH, handle_session_check)
@@ -103,6 +121,14 @@ def create_api_app(
     app.router.add_options(TRANSACTION_ITEM_PATH, handle_cors_preflight)
     app.router.add_get(SUMMARY_PATH, handle_get_summary)
     app.router.add_options(SUMMARY_PATH, handle_cors_preflight)
+    app.router.add_post(
+        AI_ANALYZE_TRANSACTIONS_PATH,
+        handle_analyze_transactions,
+    )
+    app.router.add_options(
+        AI_ANALYZE_TRANSACTIONS_PATH,
+        handle_cors_preflight,
+    )
     return app
 
 
@@ -371,6 +397,68 @@ def _serialize_summary(summary: FinancialSummary) -> dict[str, float]:
         "total_income": float(summary.total_income),
         "total_expense": float(summary.total_expense),
         "balance": float(summary.balance),
+    }
+
+
+async def handle_analyze_transactions(request: web.Request) -> web.Response:
+    expense_service = request.app[EXPENSE_SERVICE_KEY]
+    try:
+        transactions: list[TransactionRecord] = await asyncio.to_thread(
+            expense_service.list_transactions,
+        )
+    except SQLAlchemyError as error:
+        LOGGER.warning(
+            "Transactions fetch for AI analysis failed",
+            extra={"error_type": type(error).__name__},
+        )
+        return web.json_response(
+            data={"detail": DATABASE_ERROR_MESSAGE},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            headers=CORS_HEADERS,
+        )
+
+    analysis_service = request.app[ANALYSIS_SERVICE_KEY]
+    try:
+        analysis: TransactionAnalysisResult = await asyncio.to_thread(
+            analysis_service.analyze_transactions,
+            transactions=transactions,
+        )
+    except GeminiConfigurationError as error:
+        LOGGER.warning(
+            "Gemini configuration invalid",
+            extra={"error_type": type(error).__name__},
+        )
+        return web.json_response(
+            data={"detail": AI_CONFIG_ERROR_MESSAGE},
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            headers=CORS_HEADERS,
+        )
+    except GeminiAnalysisError as error:
+        LOGGER.warning(
+            "Gemini analysis failed across all fallback models",
+            extra={"error_type": type(error).__name__},
+        )
+        return web.json_response(
+            data={"detail": str(error)},
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            headers=CORS_HEADERS,
+        )
+
+    return web.json_response(
+        data=_serialize_transaction_analysis(analysis),
+        status=HTTPStatus.OK,
+        headers=CORS_HEADERS,
+    )
+
+
+def _serialize_transaction_analysis(
+    analysis: TransactionAnalysisResult,
+) -> dict[str, str | list[str]]:
+    return {
+        "summary": analysis.summary,
+        "top_expense_categories": analysis.top_expense_categories,
+        "risks": analysis.risks,
+        "advice": analysis.advice,
     }
 
 

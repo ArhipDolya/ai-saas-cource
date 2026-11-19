@@ -8,6 +8,7 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.ai import TransactionAnalysisService
 from app.api import resolve_api_address, start_api_server
 from app.auth import AdminAuthConfigError, AdminAuthService, load_admin_password
 from app.database import (
@@ -86,10 +87,12 @@ async def main() -> None:
     try:
         await asyncio.to_thread(initialize_database, engine=engine)
         expense_service = ExpenseService(engine)
+        analysis_service = TransactionAnalysisService()
         api_host, api_port = resolve_api_address()
         api_runner = await start_api_server(
             expense_service=expense_service,
             auth_service=auth_service,
+            analysis_service=analysis_service,
             host=api_host,
             port=api_port,
         )

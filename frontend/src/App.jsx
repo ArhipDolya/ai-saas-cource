@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import AdminLoginScreen from "./components/AdminLoginScreen.jsx";
 import NewOperationForm from "./components/NewOperationForm.jsx";
+import TransactionAnalysisPanel from "./components/TransactionAnalysisPanel.jsx";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const AUTH_LOGIN_ENDPOINT = `${API_BASE_URL}/api/auth/login`;
 const SUMMARY_ENDPOINT = `${API_BASE_URL}/api/summary`;
 const TRANSACTIONS_ENDPOINT = `${API_BASE_URL}/api/transactions`;
+const AI_ANALYZE_ENDPOINT = `${API_BASE_URL}/api/ai/analyze-transactions`;
 const AUTH_TOKEN_STORAGE_KEY = "finance_admin_token";
 const FILTER_ALL = "all";
 const FILTER_INCOME = "income";
@@ -602,6 +604,12 @@ export default function App() {
                   </div>
                 )}
               </section>
+
+              <TransactionAnalysisPanel
+                analyzeEndpoint={AI_ANALYZE_ENDPOINT}
+                authToken={authToken}
+                onUnauthorized={handleUnauthorized}
+              />
             </>
           )}
         </main>
