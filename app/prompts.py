@@ -1,92 +1,36 @@
-from textwrap import dedent
+from pathlib import Path
 
 
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+FINANCE_ANALYZE_PROMPT_FILENAME = "finance_analyze_prompt.txt"
+FINANCE_ANALYZE_PROMPT_PATH = PROMPTS_DIR / FINANCE_ANALYZE_PROMPT_FILENAME
+PROMPT_ENCODING = "utf-8"
 TRANSACTIONS_DATA_MARKER = "__TRANSACTIONS_JSON__"
 
-TRANSACTION_ANALYSIS_PROMPT_TEMPLATE = dedent(
-    """\
-    Ти - професійний персональний фінансовий аналітик у продукті Finance SaaS.
 
-    ## Про наш продукт
-    Finance SaaS - це веб-дашборд адміністратора та фінансовий Telegram-бот для
-    щоденного обліку особистих фінансів. Сервіс допомагає користувачам збирати всі
-    свої витрати та доходи в одному місці (через Telegram-команди та веб-інтерфейс),
-    бачити загальний баланс, контролювати розподіл коштів за категоріями та
-    вчасно виявляти небажані фінансові звички.
-
-    ## Для кого цей продукт
-    Продукт створений для приватних користувачів (переважно в Україні, валюта
-    обліку - гривня, UAH), які прагнуть навести лад в особистому бюджеті,
-    розуміти реальну структуру своїх витрат і приймати обґрунтовані фінансові
-    рішення без складних таблиць.
-
-    ## Структура вхідних транзакцій
-    Нижче ти отримаєш JSON-масив транзакцій користувача. Кожна транзакція має
-    таку структуру:
-    - transaction_type (тип операції): приймає суворо одне з двох значень:
-      - "income" - дохід (надходження коштів, наприклад зарплата чи бонус);
-      - "expense" - витрата (списання або купівля, наприклад кава, сік, таксі).
-    - amount (сума транзакції): додатне число у гривнях (UAH), наприклад 120.00.
-    - category_name (категорія): назва категорії операції, наприклад "кава",
-      "зарплата", "паливо".
-    - description (опис): текстовий коментар користувача до операції або null,
-      якщо опис не вказано.
-    - created_at (дата): дата і час створення транзакції у форматі ISO-8601
-      (наприклад, "2026-11-17T18:05:04").
-
-    ## Твоє завдання
-    1. Проаналізуй усі передані транзакції: загальний обсяг доходів ("income"),
-       загальний обсяг витрат ("expense"), чистий баланс, структуру категорій,
-       повторюваність дрібних чи великих витрат, динаміку за датами та описи.
-    2. Зроби короткий, точний і зрозумілий загальний висновок на основі реальних
-       цифр із наданих даних (не вигадуй суми, категорії або події, яких немає
-       у списку транзакцій).
-    3. Визнач ключові категорії витрат (враховуй лише транзакції з
-       transaction_type = "expense", відсортовані за сумою витрат від більшої до
-       меншої).
-    4. Сформуй основні фінансові ризики (наприклад: дефіцитний баланс, відсутність
-       зафіксованих доходів, надмірна частка однієї категорії, регулярні дрібні
-       витрати або різкі сплески витрат).
-    5. Сформуй рівно 3 конкретні практичні поради українською мовою, прив'язані
-       до реальних категорій та сум із вхідних транзакцій.
-
-    Якщо список транзакцій порожній, чесно вкажи це у summary, поверни порожні
-    масиви для top_expense_categories та risks і дай 3 стартові поради щодо
-    ведення обліку фінансів.
-
-    ## Формат відповіді (СУВОРО JSON)
-    Відповідь має бути наведена українською мовою у вигляді ОДНОГО валідного
-    JSON-об'єкта без markdown-блоків (без ```json), без коментарів і без жодного
-    додаткового тексту до чи після JSON.
-
-    Дотримуйся точно такої схеми та імен ключів:
-    {
-      "summary": "Короткий загальний висновок",
-      "top_expense_categories": ["Їжа", "Транспорт", "Кава"],
-      "risks": ["Витрати на каву зростають"],
-      "advice": [
-        "Перша конкретна порада",
-        "Друга конкретна порада",
-        "Третя конкретна порада"
-      ]
-    }
-
-    Вимоги до полів JSON:
-    - "summary": рядок (string), короткий підсумок із конкретними сумами в грн.
-    - "top_expense_categories": масив рядків (array of strings), лише категорії
-      витрат ("expense").
-    - "risks": масив рядків (array of strings), основні виявлені ризики.
-    - "advice": масив із рівно 3 рядків (array of exactly 3 strings).
-
-    ## Дані транзакцій (JSON)
-    __TRANSACTIONS_JSON__
-    """,
-)
+class PromptTemplateError(RuntimeError):
+    """The prompt template file cannot be loaded or is missing its data marker."""
 
 
 def build_transaction_analysis_prompt(transactions_json: str) -> str:
-    """Insert serialized transactions JSON into the analysis prompt template."""
-    return TRANSACTION_ANALYSIS_PROMPT_TEMPLATE.replace(
+    """Load the prompt template from disk and insert serialized transactions JSON."""
+    template = load_finance_analyze_prompt_template()
+    return template.replace(
         TRANSACTIONS_DATA_MARKER,
         transactions_json,
     )
+
+
+def load_finance_analyze_prompt_template() -> str:
+    """Read the finance analysis prompt text from the prompts directory."""
+    if not FINANCE_ANALYZE_PROMPT_PATH.is_file():
+        raise PromptTemplateError(
+            f"Prompt template file not found: {FINANCE_ANALYZE_PROMPT_PATH}",
+        )
+
+    template_text = FINANCE_ANALYZE_PROMPT_PATH.read_text(encoding=PROMPT_ENCODING)
+    if TRANSACTIONS_DATA_MARKER not in template_text:
+        raise PromptTemplateError(
+            f"Prompt template is missing the '{TRANSACTIONS_DATA_MARKER}' placeholder.",
+        )
+    return template_text

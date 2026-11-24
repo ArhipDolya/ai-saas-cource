@@ -12,6 +12,7 @@ from app.ai import (
     GeminiConfigurationError,
     TransactionAnalysisResult,
     TransactionAnalysisService,
+    TransactionLimitExceededError,
 )
 from app.auth import TOKEN_TTL_SECONDS, AdminAuthService, extract_bearer_token
 from app.expenses import (
@@ -28,6 +29,7 @@ from app.expenses import (
     parse_transaction_id,
     parse_transaction_payload,
 )
+from app.prompts import PromptTemplateError
 
 
 AUTH_LOGIN_PATH = "/api/auth/login"
@@ -423,6 +425,16 @@ async def handle_analyze_transactions(request: web.Request) -> web.Response:
             analysis_service.analyze_transactions,
             transactions=transactions,
         )
+    except TransactionLimitExceededError as error:
+        LOGGER.warning(
+            "AI analysis skipped due to transaction limit",
+            extra={"transaction_count": len(transactions)},
+        )
+        return web.json_response(
+            data={"detail": str(error)},
+            status=HTTPStatus.BAD_REQUEST,
+            headers=CORS_HEADERS,
+        )
     except GeminiConfigurationError as error:
         LOGGER.warning(
             "Gemini configuration invalid",
@@ -441,6 +453,16 @@ async def handle_analyze_transactions(request: web.Request) -> web.Response:
         return web.json_response(
             data={"detail": str(error)},
             status=HTTPStatus.SERVICE_UNAVAILABLE,
+            headers=CORS_HEADERS,
+        )
+    except PromptTemplateError as error:
+        LOGGER.error(
+            "AI prompt template loading failed",
+            extra={"error_type": type(error).__name__},
+        )
+        return web.json_response(
+            data={"detail": "Помилка конфігурації AI-промпта на сервері."},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
             headers=CORS_HEADERS,
         )
 

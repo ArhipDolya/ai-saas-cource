@@ -23,7 +23,8 @@ GEMINI_JSON_MIME_TYPE = "application/json"
 GEMINI_MODEL_PREFIX = "gemini-"
 TRANSIENT_RETRY_LIMIT = 2
 RETRY_BACKOFF_SECONDS = 1.5
-ADVICE_EXPECTED_COUNT = 3
+ADVICE_MAX_COUNT = 3
+MAX_TRANSACTIONS_FOR_ANALYSIS = 1000  # Avoid spending tokens on >1000 records.
 FREE_GEMINI_MODELS: tuple[str, ...] = (
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
@@ -66,6 +67,10 @@ class GeminiModelUnavailableError(RuntimeError):
 
 class GeminiAnalysisError(RuntimeError):
     """All candidate free Gemini models failed to analyze transactions."""
+
+
+class TransactionLimitExceededError(ValueError):
+    """The number of transactions exceeds the safe token-budget limit."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -272,8 +277,15 @@ class TransactionAnalysisService:
         transactions: list[TransactionRecord],
     ) -> TransactionAnalysisResult:
         """Build prompt from transactions and try free models until one succeeds."""
+        if len(transactions) > MAX_TRANSACTIONS_FOR_ANALYSIS:
+            raise TransactionLimitExceededError(
+                "Занадто багато транзакцій для AI-аналізу "
+                f"({len(transactions)} > {MAX_TRANSACTIONS_FOR_ANALYSIS}). "
+                "Запит до моделі не виконано, щоб не витрачати зайві токени.",
+            )
+
         auth_key, preferred_model = load_gemini_credentials()
-        serialized_transactions = _serialize_transactions_for_prompt(transactions)
+        serialized_transactions = serialize_transactions_for_prompt(transactions)
         prompt = build_transaction_analysis_prompt(serialized_transactions)
         models_to_try = self._resolve_model_order(preferred_model=preferred_model)
 
@@ -325,24 +337,31 @@ class TransactionAnalysisService:
         return [preferred_model, *remaining_models]
 
 
-def _serialize_transactions_for_prompt(
+def serialize_transactions_for_prompt(
     transactions: list[TransactionRecord],
 ) -> str:
+    """Serialize transaction records into the JSON structure expected by the prompt."""
     payload: list[dict[str, float | str | None]] = [
-        {
-            "transaction_type": transaction.transaction_type,
-            "amount": float(transaction.amount),
-            "category_name": transaction.category_name,
-            "description": transaction.description,
-            "created_at": transaction.created_at.isoformat(),
-        }
-        for transaction in transactions
+        transaction_to_prompt_dict(transaction) for transaction in transactions
     ]
     return json.dumps(
         payload,
         ensure_ascii=False,
         indent=2,
     )
+
+
+def transaction_to_prompt_dict(
+    transaction: TransactionRecord,
+) -> dict[str, float | str | None]:
+    """Convert one TransactionRecord into the LLM prompt JSON field structure."""
+    return {
+        "transaction_type": transaction.transaction_type,
+        "amount": float(transaction.amount),
+        "category_name": transaction.category_name,
+        "description": transaction.description,
+        "created_at": transaction.created_at.isoformat(),
+    }
 
 
 def _parse_analysis_json(
@@ -381,16 +400,12 @@ def _parse_analysis_json(
         value=parsed.get("advice"),
         field_name="advice",
     )
-    if len(advice) < ADVICE_EXPECTED_COUNT:
-        raise GeminiModelUnavailableError(
-            "Model JSON returned fewer than 3 advice items.",
-        )
 
     return TransactionAnalysisResult(
         summary=summary.strip(),
         top_expense_categories=top_expense_categories,
         risks=risks,
-        advice=advice[:ADVICE_EXPECTED_COUNT],
+        advice=advice[:ADVICE_MAX_COUNT],
         model=model,
     )
 
