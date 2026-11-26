@@ -3,6 +3,7 @@ import logging
 import os
 from http import HTTPMethod, HTTPStatus
 
+import psycopg
 from aiohttp import web
 from aiohttp.typedefs import Handler
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,6 +16,13 @@ from app.ai import (
     TransactionLimitExceededError,
 )
 from app.auth import TOKEN_TTL_SECONDS, AdminAuthService, extract_bearer_token
+from app.chat import (
+    ChatTurnInput,
+    ChatValidationError,
+    ProjectChatReply,
+    ProjectChatService,
+    parse_chat_payload,
+)
 from app.expenses import (
     CreateTransactionInput,
     DeletedTransaction,
@@ -38,6 +46,7 @@ TRANSACTIONS_PATH = "/api/transactions"
 TRANSACTION_ITEM_PATH = "/api/transactions/{id}"
 SUMMARY_PATH = "/api/summary"
 AI_ANALYZE_TRANSACTIONS_PATH = "/api/ai/analyze-transactions"
+AI_CHAT_PATH = "/api/ai/chat"
 DEFAULT_API_HOST = "0.0.0.0"  # Bind all interfaces for local and Docker access
 DEFAULT_API_PORT = 8000  # Default HTTP port for backend API
 API_HOST_VARIABLE = "API_HOST"
@@ -54,6 +63,7 @@ UNAUTHORIZED_MESSAGE = "Потрібна авторизація. Введіть 
 AI_CONFIG_ERROR_MESSAGE = (
     "AI-аналіз недоступний: перевірте налаштування GEMINI_API_KEY."
 )
+CHAT_STORAGE_ERROR_MESSAGE = "Failed to load or save chat history."
 CREATE_TRANSACTION_ERROR_MESSAGE = "Failed to save transaction."
 DELETE_TRANSACTION_ERROR_MESSAGE = "Failed to delete transaction."
 DATABASE_ERROR_MESSAGE = "Failed to fetch transactions."
@@ -70,6 +80,10 @@ ANALYSIS_SERVICE_KEY: web.AppKey[TransactionAnalysisService] = web.AppKey(
     "analysis_service",
     TransactionAnalysisService,
 )
+CHAT_SERVICE_KEY: web.AppKey[ProjectChatService] = web.AppKey(
+    "chat_service",
+    ProjectChatService,
+)
 PUBLIC_PATHS = frozenset({AUTH_LOGIN_PATH})
 LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +93,7 @@ async def start_api_server(
     expense_service: ExpenseService,
     auth_service: AdminAuthService,
     analysis_service: TransactionAnalysisService | None = None,
+    chat_service: ProjectChatService | None = None,
     host: str = DEFAULT_API_HOST,
     port: int = DEFAULT_API_PORT,
 ) -> web.AppRunner:
@@ -86,6 +101,7 @@ async def start_api_server(
         expense_service=expense_service,
         auth_service=auth_service,
         analysis_service=analysis_service,
+        chat_service=chat_service,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -107,11 +123,15 @@ def create_api_app(
     expense_service: ExpenseService,
     auth_service: AdminAuthService,
     analysis_service: TransactionAnalysisService | None = None,
+    chat_service: ProjectChatService | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[require_admin_auth_middleware])
     app[EXPENSE_SERVICE_KEY] = expense_service
     app[AUTH_SERVICE_KEY] = auth_service
     app[ANALYSIS_SERVICE_KEY] = analysis_service or TransactionAnalysisService()
+    app[CHAT_SERVICE_KEY] = chat_service or ProjectChatService(
+        expense_service=expense_service,
+    )
     app.router.add_post(AUTH_LOGIN_PATH, handle_login)
     app.router.add_options(AUTH_LOGIN_PATH, handle_cors_preflight)
     app.router.add_get(AUTH_SESSION_PATH, handle_session_check)
@@ -131,6 +151,8 @@ def create_api_app(
         AI_ANALYZE_TRANSACTIONS_PATH,
         handle_cors_preflight,
     )
+    app.router.add_post(AI_CHAT_PATH, handle_chat)
+    app.router.add_options(AI_CHAT_PATH, handle_cors_preflight)
     return app
 
 
@@ -435,9 +457,91 @@ async def handle_analyze_transactions(request: web.Request) -> web.Response:
             status=HTTPStatus.BAD_REQUEST,
             headers=CORS_HEADERS,
         )
-    except GeminiConfigurationError as error:
+    except (
+        GeminiConfigurationError,
+        GeminiAnalysisError,
+        PromptTemplateError,
+    ) as error:
+        return _ai_error_response(
+            error=error,
+            context_label="AI analysis",
+        )
+
+    return web.json_response(
+        data=_serialize_transaction_analysis(analysis),
+        status=HTTPStatus.OK,
+        headers=CORS_HEADERS,
+    )
+
+
+async def handle_chat(request: web.Request) -> web.Response:
+    """Handle POST /api/ai/chat with per-thread conversation history."""
+    try:
+        raw_payload: object = await request.json()
+    except ValueError:
+        return web.json_response(
+            data={"detail": INVALID_JSON_MESSAGE},
+            status=HTTPStatus.BAD_REQUEST,
+            headers=CORS_HEADERS,
+        )
+
+    try:
+        chat_input: ChatTurnInput = parse_chat_payload(raw_payload)
+    except ChatValidationError as error:
+        return web.json_response(
+            data={"detail": str(error)},
+            status=HTTPStatus.BAD_REQUEST,
+            headers=CORS_HEADERS,
+        )
+
+    chat_service = request.app[CHAT_SERVICE_KEY]
+    try:
+        reply: ProjectChatReply = await asyncio.to_thread(
+            chat_service.answer_message,
+            chat_input=chat_input,
+        )
+    except (SQLAlchemyError, psycopg.Error) as error:
         LOGGER.warning(
-            "Gemini configuration invalid",
+            "AI chat DB or checkpointer operation failed",
+            extra={
+                "error_type": type(error).__name__,
+                "thread_id": chat_input.thread_id,
+            },
+        )
+        return web.json_response(
+            data={"detail": CHAT_STORAGE_ERROR_MESSAGE},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            headers=CORS_HEADERS,
+        )
+    except (
+        GeminiConfigurationError,
+        GeminiAnalysisError,
+        PromptTemplateError,
+    ) as error:
+        return _ai_error_response(
+            error=error,
+            context_label="AI chat",
+        )
+
+    return web.json_response(
+        data={
+            "answer": reply.answer,
+            "thread_id": reply.thread_id,
+        },
+        status=HTTPStatus.OK,
+        headers=CORS_HEADERS,
+    )
+
+
+def _ai_error_response(
+    *,
+    error: Exception,
+    context_label: str,
+) -> web.Response:
+    if isinstance(error, GeminiConfigurationError):
+        LOGGER.warning(
+            "%s failed due to Gemini configuration",
+            context_label,
             extra={"error_type": type(error).__name__},
         )
         return web.json_response(
@@ -445,9 +549,11 @@ async def handle_analyze_transactions(request: web.Request) -> web.Response:
             status=HTTPStatus.SERVICE_UNAVAILABLE,
             headers=CORS_HEADERS,
         )
-    except GeminiAnalysisError as error:
+
+    if isinstance(error, GeminiAnalysisError):
         LOGGER.warning(
-            "Gemini analysis failed across all fallback models",
+            "%s failed across all fallback models",
+            context_label,
             extra={"error_type": type(error).__name__},
         )
         return web.json_response(
@@ -455,20 +561,15 @@ async def handle_analyze_transactions(request: web.Request) -> web.Response:
             status=HTTPStatus.SERVICE_UNAVAILABLE,
             headers=CORS_HEADERS,
         )
-    except PromptTemplateError as error:
-        LOGGER.error(
-            "AI prompt template loading failed",
-            extra={"error_type": type(error).__name__},
-        )
-        return web.json_response(
-            data={"detail": "Помилка конфігурації AI-промпта на сервері."},
-            status=HTTPStatus.INTERNAL_SERVER_ERROR,
-            headers=CORS_HEADERS,
-        )
 
+    LOGGER.error(
+        "%s prompt template loading failed",
+        context_label,
+        extra={"error_type": type(error).__name__},
+    )
     return web.json_response(
-        data=_serialize_transaction_analysis(analysis),
-        status=HTTPStatus.OK,
+        data={"detail": "Помилка конфігурації AI-промпта на сервері."},
+        status=HTTPStatus.INTERNAL_SERVER_ERROR,
         headers=CORS_HEADERS,
     )
 

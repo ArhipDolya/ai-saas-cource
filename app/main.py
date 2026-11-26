@@ -2,19 +2,23 @@ import asyncio
 import logging
 import os
 
+import psycopg
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
+from langgraph.checkpoint.postgres import PostgresSaver
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai import TransactionAnalysisService
 from app.api import resolve_api_address, start_api_server
 from app.auth import AdminAuthConfigError, AdminAuthService, load_admin_password
+from app.chat import ProjectChatService
 from app.database import (
     ENV_PATH,
     DatabaseConfigurationError,
     create_database_engine,
+    create_langgraph_postgres_pool,
     initialize_database,
 )
 from app.expenses import ExpenseService, ExpenseValidationError, parse_expense
@@ -89,18 +93,26 @@ async def main() -> None:
         expense_service = ExpenseService(engine)
         analysis_service = TransactionAnalysisService()
         api_host, api_port = resolve_api_address()
-        api_runner = await start_api_server(
-            expense_service=expense_service,
-            auth_service=auth_service,
-            analysis_service=analysis_service,
-            host=api_host,
-            port=api_port,
-        )
-        dispatcher = create_dispatcher(expense_service=expense_service)
+        with create_langgraph_postgres_pool() as langgraph_pool:
+            checkpointer = PostgresSaver(langgraph_pool)
+            await asyncio.to_thread(checkpointer.setup)
+            chat_service = ProjectChatService(
+                expense_service=expense_service,
+                checkpointer=checkpointer,
+            )
+            api_runner = await start_api_server(
+                expense_service=expense_service,
+                auth_service=auth_service,
+                analysis_service=analysis_service,
+                chat_service=chat_service,
+                host=api_host,
+                port=api_port,
+            )
+            dispatcher = create_dispatcher(expense_service=expense_service)
 
-        async with Bot(token=bot_token) as bot:
-            LOGGER.info("Бот почав роботу")
-            await dispatcher.start_polling(bot)
+            async with Bot(token=bot_token) as bot:
+                LOGGER.info("Бот почав роботу")
+                await dispatcher.start_polling(bot)
     finally:
         if api_runner is not None:
             await api_runner.cleanup()
@@ -124,7 +136,7 @@ if __name__ == "__main__":
         raise SystemExit(
             "Cannot start bot. Set ADMIN_PASSWORD in the environment or .env.",
         ) from None
-    except (DatabaseConfigurationError, SQLAlchemyError) as error:
+    except (DatabaseConfigurationError, SQLAlchemyError, psycopg.Error) as error:
         LOGGER.error(
             "Database startup failed",
             extra={"error_type": type(error).__name__},

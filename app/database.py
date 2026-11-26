@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.engine.interfaces import ReflectedForeignKeyConstraint
@@ -23,7 +25,10 @@ from app.models import (
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 DATABASE_URL_VARIABLE = "DATABASE_URL"
 POSTGRESQL_DRIVER = "postgresql+psycopg"
+LIBPQ_POSTGRES_DRIVER = "postgresql"  # Scheme required by psycopg ConnectionPool.
 CONNECTION_TIMEOUT_SECONDS = 10
+LANGGRAPH_POOL_MIN_SIZE = 1  # Keep Neon free-tier idle connections minimal.
+LANGGRAPH_POOL_MAX_SIZE = 5
 
 
 class DatabaseConfigurationError(ValueError):
@@ -31,6 +36,43 @@ class DatabaseConfigurationError(ValueError):
 
 
 def create_database_engine() -> Engine:
+    """Create the SQLAlchemy engine connected to Neon PostgreSQL."""
+    connection_url = _parse_postgres_url()
+    return create_engine(
+        url=connection_url.set(drivername=POSTGRESQL_DRIVER),
+        connect_args={"connect_timeout": CONNECTION_TIMEOUT_SECONDS},
+        pool_pre_ping=True,
+        hide_parameters=True,
+    )
+
+
+def load_postgres_connection_string() -> str:
+    """Return a normalized psycopg PostgreSQL URI from DATABASE_URL."""
+    connection_url = _parse_postgres_url()
+    return connection_url.set(drivername=LIBPQ_POSTGRES_DRIVER).render_as_string(
+        hide_password=False,
+    )
+
+
+def create_langgraph_postgres_pool() -> ConnectionPool:
+    """Create a psycopg ConnectionPool configured for Neon DB and LangGraph PostgresSaver."""
+    conninfo = load_postgres_connection_string()
+    return ConnectionPool(
+        conninfo=conninfo,
+        min_size=LANGGRAPH_POOL_MIN_SIZE,
+        max_size=LANGGRAPH_POOL_MAX_SIZE,
+        check=ConnectionPool.check_connection,
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+            "connect_timeout": CONNECTION_TIMEOUT_SECONDS,
+        },
+        open=False,
+    )
+
+
+def _parse_postgres_url() -> URL:
     load_dotenv(dotenv_path=ENV_PATH)
     database_url = os.getenv(DATABASE_URL_VARIABLE, "").strip()
     if not database_url:
@@ -46,13 +88,7 @@ def create_database_engine() -> Engine:
     is_postgresql = connection_url.get_backend_name() in {"postgres", "postgresql"}
     if not is_postgresql:
         raise DatabaseConfigurationError("DATABASE_URL must point to PostgreSQL.")
-
-    return create_engine(
-        url=connection_url.set(drivername=POSTGRESQL_DRIVER),
-        connect_args={"connect_timeout": CONNECTION_TIMEOUT_SECONDS},
-        pool_pre_ping=True,
-        hide_parameters=True,
-    )
+    return connection_url
 
 
 def initialize_database(engine: Engine) -> None:

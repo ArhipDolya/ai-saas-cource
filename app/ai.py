@@ -4,8 +4,10 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
+from typing import TypeVar
 
 from dotenv import load_dotenv
 
@@ -14,6 +16,7 @@ from app.expenses import TransactionRecord
 from app.prompts import build_transaction_analysis_prompt
 
 
+TResult = TypeVar("TResult")
 GEMINI_API_KEY_VARIABLE = "GEMINI_API_KEY"
 GEMINI_MODEL_VARIABLE = "GEMINI_MODEL"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"  # Default fast Gemini Flash-Lite model.
@@ -74,9 +77,18 @@ class TransactionLimitExceededError(ValueError):
 
 
 @dataclass(frozen=True, kw_only=True)
+class GeminiFunctionCall:
+    name: str
+    args: dict[str, object]
+    thought_signature: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
 class GeminiCompletionResult:
     model: str
     reply_text: str
+    function_calls: tuple[GeminiFunctionCall, ...] = ()
+    raw_parts: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -109,20 +121,45 @@ def request_gemini_text(
     expect_json: bool = False,
     timeout_seconds: int = GEMINI_REQUEST_TIMEOUT_SECONDS,
 ) -> GeminiCompletionResult:
-    """Call Gemini generateContent for one model and parse the reply text."""
-    payload: dict[str, object] = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}],
-            },
-        ],
-    }
-    is_gemini_family = model.startswith(GEMINI_MODEL_PREFIX)
-    if expect_json and is_gemini_family:
-        payload["generationConfig"] = {
-            "responseMimeType": GEMINI_JSON_MIME_TYPE,
-        }
+    """Call Gemini generateContent for one prompt string and parse non-empty reply text."""
+    contents: list[dict[str, object]] = [
+        {
+            "role": "user",
+            "parts": [{"text": prompt}],
+        },
+    ]
+    result = request_gemini_contents(
+        auth_key=auth_key,
+        model=model,
+        contents=contents,
+        expect_json=expect_json,
+        timeout_seconds=timeout_seconds,
+    )
+    if not result.reply_text:
+        raise GeminiModelUnavailableError(
+            "Gemini API returned an empty text reply.",
+        )
+    return result
 
+
+def request_gemini_contents(
+    *,
+    auth_key: str,
+    model: str,
+    contents: list[dict[str, object]],
+    system_instruction: str | None = None,
+    tools: list[dict[str, object]] | None = None,
+    expect_json: bool = False,
+    timeout_seconds: int = GEMINI_REQUEST_TIMEOUT_SECONDS,
+) -> GeminiCompletionResult:
+    """Call Gemini generateContent with multi-turn contents, tools, and system prompt."""
+    payload = _build_gemini_payload(
+        model=model,
+        contents=contents,
+        system_instruction=system_instruction,
+        tools=tools,
+        expect_json=expect_json,
+    )
     endpoint = f"{GEMINI_API_BASE_URL}/{model}:generateContent"
     request_body = json.dumps(payload).encode("utf-8")
     response_payload = _post_json_with_transient_retries(
@@ -131,7 +168,7 @@ def request_gemini_text(
         request_body=request_body,
         timeout_seconds=timeout_seconds,
     )
-    reply_text = _extract_reply_text(response_payload)
+    reply_text, function_calls, raw_parts = _extract_response_content(response_payload)
     resolved_model = (
         response_payload.get("modelVersion")
         if isinstance(response_payload, dict)
@@ -143,7 +180,75 @@ def request_gemini_text(
     return GeminiCompletionResult(
         model=model_name,
         reply_text=reply_text,
+        function_calls=function_calls,
+        raw_parts=raw_parts,
     )
+
+
+def _build_gemini_payload(
+    *,
+    model: str,
+    contents: list[dict[str, object]],
+    system_instruction: str | None,
+    tools: list[dict[str, object]] | None,
+    expect_json: bool,
+) -> dict[str, object]:
+    is_gemini_family = model.startswith(GEMINI_MODEL_PREFIX)
+    prepared_contents = list(contents)
+    payload: dict[str, object] = {}
+
+    if system_instruction:
+        if is_gemini_family:
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_instruction}],
+            }
+        else:
+            prepared_contents = _inject_system_instruction_into_contents(
+                contents=prepared_contents,
+                system_instruction=system_instruction,
+            )
+
+    payload["contents"] = prepared_contents
+    if tools:
+        payload["tools"] = [{"functionDeclarations": tools}]
+    if expect_json and is_gemini_family:
+        payload["generationConfig"] = {
+            "responseMimeType": GEMINI_JSON_MIME_TYPE,
+        }
+    return payload
+
+
+def _inject_system_instruction_into_contents(
+    *,
+    contents: list[dict[str, object]],
+    system_instruction: str,
+) -> list[dict[str, object]]:
+    # Non-Gemini models (for example Gemma fallbacks) may reject systemInstruction.
+    if not contents:
+        return [
+            {
+                "role": "user",
+                "parts": [{"text": system_instruction}],
+            },
+        ]
+
+    first_turn = contents[0]
+    first_parts = first_turn.get("parts")
+    is_user_turn = first_turn.get("role") == "user" and isinstance(first_parts, list)
+    if is_user_turn:
+        updated_first_turn = {
+            **first_turn,
+            "parts": [{"text": f"{system_instruction}\n\n"}, *first_parts],
+        }
+        return [updated_first_turn, *contents[1:]]
+
+    return [
+        {
+            "role": "user",
+            "parts": [{"text": system_instruction}],
+        },
+        *contents,
+    ]
 
 
 def _post_json_with_transient_retries(
@@ -226,7 +331,9 @@ def _extract_http_error_message(error: urllib.error.HTTPError) -> str:
     return "Unexpected error response."
 
 
-def _extract_reply_text(payload: object) -> str:
+def _extract_response_content(
+    payload: object,
+) -> tuple[str, tuple[GeminiFunctionCall, ...], tuple[dict[str, object], ...]]:
     if not isinstance(payload, dict):
         raise GeminiModelUnavailableError(
             "Gemini API returned an unexpected payload type.",
@@ -248,17 +355,49 @@ def _extract_reply_text(payload: object) -> str:
             "Gemini API returned empty content parts.",
         )
 
-    text_chunks = [
-        part["text"]
-        for part in parts
-        if isinstance(part, dict) and isinstance(part.get("text"), str)
-    ]
+    raw_parts: list[dict[str, object]] = []
+    text_chunks: list[str] = []
+    function_calls: list[GeminiFunctionCall] = []
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        raw_parts.append(part)
+
+        part_text = part.get("text")
+        is_thought_part = bool(part.get("thought"))
+        if isinstance(part_text, str) and not is_thought_part:
+            text_chunks.append(part_text)
+
+        raw_call = part.get("functionCall")
+        if isinstance(raw_call, dict):
+            call_name = raw_call.get("name")
+            raw_args = raw_call.get("args")
+            if isinstance(call_name, str) and call_name.strip():
+                normalized_args: dict[str, object] = (
+                    {str(k): v for k, v in raw_args.items()}
+                    if isinstance(raw_args, dict)
+                    else {}
+                )
+                thought_signature = part.get("thoughtSignature")
+                function_calls.append(
+                    GeminiFunctionCall(
+                        name=call_name.strip(),
+                        args=normalized_args,
+                        thought_signature=(
+                            thought_signature
+                            if isinstance(thought_signature, str)
+                            else None
+                        ),
+                    ),
+                )
+
     reply_text = "".join(text_chunks).strip()
-    if not reply_text:
+    if not reply_text and not function_calls:
         raise GeminiModelUnavailableError(
             "Gemini API returned an empty text reply.",
         )
-    return reply_text
+    return reply_text, tuple(function_calls), tuple(raw_parts)
 
 
 class TransactionAnalysisService:
@@ -284,57 +423,74 @@ class TransactionAnalysisService:
                 "Запит до моделі не виконано, щоб не витрачати зайві токени.",
             )
 
-        auth_key, preferred_model = load_gemini_credentials()
         serialized_transactions = serialize_transactions_for_prompt(transactions)
         prompt = build_transaction_analysis_prompt(serialized_transactions)
-        models_to_try = self._resolve_model_order(preferred_model=preferred_model)
 
-        failure_reasons: list[str] = []
-        for model in models_to_try:
-            try:
-                completion = request_gemini_text(
-                    auth_key=auth_key,
-                    model=model,
-                    prompt=prompt,
-                    expect_json=True,
-                )
-                analysis = _parse_analysis_json(
-                    raw_text=completion.reply_text,
-                    model=completion.model,
-                )
-                LOGGER.info(
-                    "Transactions analyzed with Gemini",
-                    extra={
-                        "model": analysis.model,
-                        "transaction_count": len(transactions),
-                    },
-                )
-                return analysis
-            except GeminiModelUnavailableError as error:
-                LOGGER.warning(
-                    "Gemini candidate model unavailable, trying next fallback",
-                    extra={
-                        "model": model,
-                        "reason": str(error)[:200],
-                    },
-                )
-                failure_reasons.append(f"{model}: {error}")
+        def call_model(*, auth_key: str, model: str) -> TransactionAnalysisResult:
+            completion = request_gemini_text(
+                auth_key=auth_key,
+                model=model,
+                prompt=prompt,
+                expect_json=True,
+            )
+            analysis = _parse_analysis_json(
+                raw_text=completion.reply_text,
+                model=completion.model,
+            )
+            LOGGER.info(
+                "Transactions analyzed with Gemini",
+                extra={
+                    "model": analysis.model,
+                    "transaction_count": len(transactions),
+                },
+            )
+            return analysis
 
-        raise GeminiAnalysisError(
-            "Усі безкоштовні LLM-моделі зараз недоступні. Спробуйте пізніше.",
+        return run_gemini_with_fallback(
+            candidate_models=self._candidate_models,
+            call_model=call_model,
         )
 
-    def _resolve_model_order(
-        self,
-        *,
-        preferred_model: str | None,
-    ) -> list[str]:
-        if preferred_model is None:
-            return list(self._candidate_models)
-        remaining_models = [
-            model for model in self._candidate_models if model != preferred_model
-        ]
-        return [preferred_model, *remaining_models]
+
+def resolve_candidate_models(
+    *,
+    preferred_model: str | None,
+    candidate_models: tuple[str, ...],
+) -> list[str]:
+    """Order candidate free models with an explicit env override tried first."""
+    if preferred_model is None:
+        return list(candidate_models)
+    remaining_models = [model for model in candidate_models if model != preferred_model]
+    return [preferred_model, *remaining_models]
+
+
+def run_gemini_with_fallback(
+    *,
+    candidate_models: tuple[str, ...],
+    call_model: Callable[..., TResult],
+) -> TResult:
+    """Try candidate free models in priority order until one succeeds."""
+    auth_key, preferred_model = load_gemini_credentials()
+    models_to_try = resolve_candidate_models(
+        preferred_model=preferred_model,
+        candidate_models=candidate_models,
+    )
+
+    for model in models_to_try:
+        try:
+            return call_model(auth_key=auth_key, model=model)
+        except GeminiModelUnavailableError as error:
+            LOGGER.warning(
+                "Gemini candidate model unavailable, trying next fallback",
+                extra={
+                    "model": model,
+                    "reason": str(error)[:200],
+                },
+            )
+
+    raise GeminiAnalysisError(
+        "Усі безкоштовні LLM-моделі зараз недоступні. Спробуйте пізніше.",
+    )
 
 
 def serialize_transactions_for_prompt(

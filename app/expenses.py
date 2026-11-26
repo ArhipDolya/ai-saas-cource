@@ -1,11 +1,13 @@
+import calendar
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, literal, select, union_all
+from sqlalchemy import case, func, literal, select, union_all
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.sql import Select, Subquery
 
 from app.models import (
     CATEGORIES,
@@ -22,6 +24,20 @@ from app.models import (
 EXPENSE_USAGE = "Використай команду: /expense 120 кава"
 AMOUNT_PATTERN = re.compile(r"[0-9]+(?:[.,][0-9]{1,2})?")
 DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+MONTH_PERIOD_PATTERN = re.compile(r"^(\d{4})-(\d{2})$")
+RANGE_PERIOD_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})(?::|\.\.)(\d{4}-\d{2}-\d{2})$")
+PERIOD_ALL = "all"
+PERIOD_TODAY = "today"
+PERIOD_WEEK = "week"
+PERIOD_SEVEN_DAYS = "7d"
+PERIOD_MONTH = "month"
+PERIOD_THIRTY_DAYS = "30d"
+PERIOD_YEAR = "year"
+WEEK_LOOKBACK_DAYS = 6  # Inclusive 7-day window including current day.
+MONTH_LOOKBACK_DAYS = 29  # Inclusive 30-day window including current day.
+MIN_TOP_EXPENSES_LIMIT = 1
+DEFAULT_TOP_EXPENSES_LIMIT = 5
+MAX_TOP_EXPENSES_LIMIT = 50
 ZERO_AMOUNT = Decimal("0.00")
 MINIMUM_EXPENSE_AMOUNT = Decimal("0.01")
 MAXIMUM_EXPENSE_AMOUNT = Decimal("9999999999.99")  # NUMERIC(12, 2).
@@ -108,6 +124,175 @@ class CreateTransactionInput:
 class DeletedTransaction:
     id: int
     transaction_type: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class PeriodRange:
+    period: str
+    start_at: datetime | None
+    end_at: datetime | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class PeriodFinancialSummary:
+    period: str
+    start_at: datetime | None
+    end_at: datetime | None
+    total_income: Decimal
+    total_expense: Decimal
+    balance: Decimal
+    income_count: int
+    expense_count: int
+    total_count: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class CategoryTotalRecord:
+    category_name: str
+    transaction_type: str
+    total_amount: Decimal
+    transactions_count: int
+
+
+def parse_analytics_period(
+    *,
+    period: str | None = PERIOD_ALL,
+    reference_now: datetime | None = None,
+) -> PeriodRange:
+    """Parse a named or explicit date period into inclusive datetime bounds."""
+    if period is None:
+        return PeriodRange(period=PERIOD_ALL, start_at=None, end_at=None)
+    if not isinstance(period, str):
+        raise TransactionValidationError(
+            "Параметр period має бути рядком (наприклад: all, today, week, month, 30d, year, 2026-11).",
+        )
+
+    normalized_period = period.strip().lower()
+    if not normalized_period or normalized_period == PERIOD_ALL:
+        return PeriodRange(period=PERIOD_ALL, start_at=None, end_at=None)
+
+    current_time = (reference_now or datetime.now()).replace(microsecond=0)
+    today_date = current_time.date()
+    end_of_today = datetime.combine(today_date, time(23, 59, 59))
+
+    if normalized_period == PERIOD_TODAY:
+        return PeriodRange(
+            period=PERIOD_TODAY,
+            start_at=datetime.combine(today_date, time.min),
+            end_at=end_of_today,
+        )
+    if normalized_period in {PERIOD_WEEK, PERIOD_SEVEN_DAYS}:
+        start_date = today_date - timedelta(days=WEEK_LOOKBACK_DAYS)
+        return PeriodRange(
+            period=normalized_period,
+            start_at=datetime.combine(start_date, time.min),
+            end_at=end_of_today,
+        )
+    if normalized_period == PERIOD_MONTH:
+        return PeriodRange(
+            period=PERIOD_MONTH,
+            start_at=datetime.combine(today_date.replace(day=1), time.min),
+            end_at=end_of_today,
+        )
+    if normalized_period == PERIOD_THIRTY_DAYS:
+        start_date = today_date - timedelta(days=MONTH_LOOKBACK_DAYS)
+        return PeriodRange(
+            period=PERIOD_THIRTY_DAYS,
+            start_at=datetime.combine(start_date, time.min),
+            end_at=end_of_today,
+        )
+    if normalized_period == PERIOD_YEAR:
+        return PeriodRange(
+            period=PERIOD_YEAR,
+            start_at=datetime.combine(date(today_date.year, 1, 1), time.min),
+            end_at=end_of_today,
+        )
+
+    month_match = MONTH_PERIOD_PATTERN.fullmatch(normalized_period)
+    if month_match is not None:
+        year = int(month_match.group(1))
+        month = int(month_match.group(2))
+        return _build_month_period_range(
+            normalized_period=normalized_period,
+            year=year,
+            month=month,
+        )
+
+    range_match = RANGE_PERIOD_PATTERN.fullmatch(normalized_period)
+    if range_match is not None:
+        return _build_custom_period_range(
+            normalized_period=normalized_period,
+            start_text=range_match.group(1),
+            end_text=range_match.group(2),
+        )
+
+    raise TransactionValidationError(
+        "Невідомий період. Допустимі значення: all, today, week, 7d, month, 30d, year, "
+        "YYYY-MM або YYYY-MM-DD:YYYY-MM-DD.",
+    )
+
+
+def _build_month_period_range(
+    *,
+    normalized_period: str,
+    year: int,
+    month: int,
+) -> PeriodRange:
+    is_valid_year = MIN_TRANSACTION_YEAR <= year <= MAX_TRANSACTION_YEAR
+    is_valid_month = 1 <= month <= 12
+    if not is_valid_year or not is_valid_month:
+        raise TransactionValidationError(
+            "Некоректний місяць у параметрі period. Використовуйте формат YYYY-MM.",
+        )
+    last_day = calendar.monthrange(year, month)[1]
+    return PeriodRange(
+        period=normalized_period,
+        start_at=datetime.combine(date(year, month, 1), time.min),
+        end_at=datetime.combine(date(year, month, last_day), time(23, 59, 59)),
+    )
+
+
+def _build_custom_period_range(
+    *,
+    normalized_period: str,
+    start_text: str,
+    end_text: str,
+) -> PeriodRange:
+    try:
+        start_date = date.fromisoformat(start_text)
+        end_date = date.fromisoformat(end_text)
+    except ValueError:
+        raise TransactionValidationError(
+            "Некоректні дати в періоді. Використовуйте YYYY-MM-DD:YYYY-MM-DD.",
+        ) from None
+
+    is_start_valid = MIN_TRANSACTION_YEAR <= start_date.year <= MAX_TRANSACTION_YEAR
+    is_end_valid = MIN_TRANSACTION_YEAR <= end_date.year <= MAX_TRANSACTION_YEAR
+    if not is_start_valid or not is_end_valid or start_date > end_date:
+        raise TransactionValidationError(
+            "Початкова дата періоду не може бути пізнішою за кінцеву.",
+        )
+    return PeriodRange(
+        period=normalized_period,
+        start_at=datetime.combine(start_date, time.min),
+        end_at=datetime.combine(end_date, time(23, 59, 59)),
+    )
+
+
+def validate_top_expenses_limit(limit: object) -> int:
+    """Validate integer top-expenses limit strictly within [1, 50]."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TransactionValidationError(
+            f"Параметр limit має бути цілим числом від {MIN_TOP_EXPENSES_LIMIT} "
+            f"до {MAX_TOP_EXPENSES_LIMIT}.",
+        )
+    is_in_range = MIN_TOP_EXPENSES_LIMIT <= limit <= MAX_TOP_EXPENSES_LIMIT
+    if not is_in_range:
+        raise TransactionValidationError(
+            f"Параметр limit має бути в межах від {MIN_TOP_EXPENSES_LIMIT} "
+            f"до {MAX_TOP_EXPENSES_LIMIT}.",
+        )
+    return limit
 
 
 def parse_transaction_id(raw_id: object) -> int:
@@ -473,6 +658,212 @@ class ExpenseService:
         *,
         transaction_type: str | None = None,
     ) -> list[TransactionRecord]:
+        combined_operations = self._build_combined_operations_subquery()
+        statement = select(combined_operations)
+        if transaction_type is not None:
+            statement = statement.where(
+                combined_operations.c.transaction_type == transaction_type,
+            )
+        statement = statement.order_by(
+            combined_operations.c.created_at.desc(),
+            combined_operations.c.id.desc(),
+        )
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).all()
+
+        return [
+            TransactionRecord(
+                id=row.id,
+                user_id=row.user_id,
+                telegram_id=row.telegram_id,
+                category_id=row.category_id,
+                category_name=row.category_name,
+                transaction_type=row.transaction_type,
+                amount=row.amount,
+                description=row.description,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    def get_transactions_summary_for_period(
+        self,
+        *,
+        period: str = PERIOD_ALL,
+        reference_now: datetime | None = None,
+    ) -> PeriodFinancialSummary:
+        """Read-only SQL summary of income, expenses, balance, and counts for a period."""
+        period_range = parse_analytics_period(
+            period=period,
+            reference_now=reference_now,
+        )
+        operations = self._build_combined_operations_subquery()
+        income_sum_expr = func.coalesce(
+            func.sum(
+                case(
+                    (
+                        operations.c.transaction_type == INCOME_TRANSACTION_TYPE,
+                        operations.c.amount,
+                    ),
+                    else_=ZERO_AMOUNT,
+                ),
+            ),
+            ZERO_AMOUNT,
+        )
+        expense_sum_expr = func.coalesce(
+            func.sum(
+                case(
+                    (
+                        operations.c.transaction_type == EXPENSE_TRANSACTION_TYPE,
+                        operations.c.amount,
+                    ),
+                    else_=ZERO_AMOUNT,
+                ),
+            ),
+            ZERO_AMOUNT,
+        )
+        income_count_expr = func.coalesce(
+            func.sum(
+                case(
+                    (operations.c.transaction_type == INCOME_TRANSACTION_TYPE, 1),
+                    else_=0,
+                ),
+            ),
+            0,
+        )
+        expense_count_expr = func.coalesce(
+            func.sum(
+                case(
+                    (operations.c.transaction_type == EXPENSE_TRANSACTION_TYPE, 1),
+                    else_=0,
+                ),
+            ),
+            0,
+        )
+        statement = select(
+            income_sum_expr.label("total_income"),
+            expense_sum_expr.label("total_expense"),
+            income_count_expr.label("income_count"),
+            expense_count_expr.label("expense_count"),
+        ).select_from(operations)
+        statement = self._apply_period_filter(
+            statement=statement,
+            operations=operations,
+            period_range=period_range,
+        )
+        with self._engine.connect() as connection:
+            row = connection.execute(statement).one()
+
+        total_income = Decimal(row.total_income).quantize(AMOUNT_QUANTUM)
+        total_expense = Decimal(row.total_expense).quantize(AMOUNT_QUANTUM)
+        balance = (total_income - total_expense).quantize(AMOUNT_QUANTUM)
+        income_count = int(row.income_count)
+        expense_count = int(row.expense_count)
+        return PeriodFinancialSummary(
+            period=period_range.period,
+            start_at=period_range.start_at,
+            end_at=period_range.end_at,
+            total_income=total_income,
+            total_expense=total_expense,
+            balance=balance,
+            income_count=income_count,
+            expense_count=expense_count,
+            total_count=income_count + expense_count,
+        )
+
+    def get_category_totals_for_period(
+        self,
+        *,
+        period: str = PERIOD_ALL,
+        reference_now: datetime | None = None,
+    ) -> list[CategoryTotalRecord]:
+        """Read-only SQL category totals grouped by category name and type."""
+        period_range = parse_analytics_period(
+            period=period,
+            reference_now=reference_now,
+        )
+        operations = self._build_combined_operations_subquery()
+        total_amount_expr = func.coalesce(
+            func.sum(operations.c.amount),
+            ZERO_AMOUNT,
+        ).label("total_amount")
+        statement = select(
+            operations.c.category_name,
+            operations.c.transaction_type,
+            total_amount_expr,
+            func.count().label("transactions_count"),
+        )
+        statement = self._apply_period_filter(
+            statement=statement,
+            operations=operations,
+            period_range=period_range,
+        )
+        statement = statement.group_by(
+            operations.c.category_name,
+            operations.c.transaction_type,
+        ).order_by(
+            total_amount_expr.desc(),
+            operations.c.category_name.asc(),
+        )
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).all()
+
+        return [
+            CategoryTotalRecord(
+                category_name=str(row.category_name),
+                transaction_type=str(row.transaction_type),
+                total_amount=Decimal(row.total_amount).quantize(AMOUNT_QUANTUM),
+                transactions_count=int(row.transactions_count),
+            )
+            for row in rows
+        ]
+
+    def get_top_expenses_for_period(
+        self,
+        *,
+        period: str = PERIOD_ALL,
+        limit: int = DEFAULT_TOP_EXPENSES_LIMIT,
+        reference_now: datetime | None = None,
+    ) -> list[TransactionRecord]:
+        """Read-only SQL query returning highest expense records for a period."""
+        period_range = parse_analytics_period(
+            period=period,
+            reference_now=reference_now,
+        )
+        validated_limit = validate_top_expenses_limit(limit)
+        operations = self._build_combined_operations_subquery()
+        statement = select(operations).where(
+            operations.c.transaction_type == EXPENSE_TRANSACTION_TYPE,
+        )
+        statement = self._apply_period_filter(
+            statement=statement,
+            operations=operations,
+            period_range=period_range,
+        )
+        statement = statement.order_by(
+            operations.c.amount.desc(),
+            operations.c.created_at.desc(),
+            operations.c.id.desc(),
+        ).limit(validated_limit)
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).all()
+
+        return [
+            TransactionRecord(
+                id=row.id,
+                user_id=row.user_id,
+                telegram_id=row.telegram_id,
+                category_id=row.category_id,
+                category_name=row.category_name,
+                transaction_type=row.transaction_type,
+                amount=row.amount,
+                description=row.description,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    def _build_combined_operations_subquery(self) -> Subquery:
         transactions_query = select(
             TRANSACTIONS.c.id,
             TRANSACTIONS.c.user_id,
@@ -513,36 +904,24 @@ class ExpenseService:
                 INCOMES.c.user_id == USERS.c.id,
             ),
         )
-        combined_operations = union_all(
+        return union_all(
             transactions_query,
             incomes_query,
         ).subquery()
-        statement = select(combined_operations)
-        if transaction_type is not None:
-            statement = statement.where(
-                combined_operations.c.transaction_type == transaction_type,
-            )
-        statement = statement.order_by(
-            combined_operations.c.created_at.desc(),
-            combined_operations.c.id.desc(),
-        )
-        with self._engine.connect() as connection:
-            rows = connection.execute(statement).all()
 
-        return [
-            TransactionRecord(
-                id=row.id,
-                user_id=row.user_id,
-                telegram_id=row.telegram_id,
-                category_id=row.category_id,
-                category_name=row.category_name,
-                transaction_type=row.transaction_type,
-                amount=row.amount,
-                description=row.description,
-                created_at=row.created_at,
-            )
-            for row in rows
-        ]
+    def _apply_period_filter(
+        self,
+        *,
+        statement: Select,
+        operations: Subquery,
+        period_range: PeriodRange,
+    ) -> Select:
+        filtered = statement
+        if period_range.start_at is not None:
+            filtered = filtered.where(operations.c.created_at >= period_range.start_at)
+        if period_range.end_at is not None:
+            filtered = filtered.where(operations.c.created_at <= period_range.end_at)
+        return filtered
 
     def get_summary(self) -> FinancialSummary:
         incomes_table_sum = select(
